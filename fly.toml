@@ -1,0 +1,25 @@
+app = "personal-assistant"
+primary_region = "sin"        # put this near you; it is the webhook latency
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false  # a webhook that has to cold-start is a webhook
+  auto_start_machines = true  # that times out
+  min_machines_running = 1
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+# The 11am check-in (D6). Fly cron is a scheduled machine, not a fly.toml
+# stanza — create it once, after the first deploy:
+#
+#   fly machine run . --schedule hourly --command \
+#     "curl -fsS -X POST https://<app>.fly.dev/cron/tick -H 'x-cron-secret: $CRON_SECRET'"
+#
+# Hourly, not daily: /cron/tick converts to each user's local time and fires
+# only in their 11am hour.
