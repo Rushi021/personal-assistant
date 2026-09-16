@@ -66,7 +66,12 @@ async def send(to: str, text: str, buttons: list[Button] | None = None) -> None:
             "inline_keyboard": [[{"text": b.label, "callback_data": b.payload} for b in buttons]]
         }
     async with httpx.AsyncClient(timeout=15) as http:
-        await http.post(f"{API}/sendMessage", json=payload)
+        r = await http.post(f"{API}/sendMessage", json=payload)
+    # Telegram answers 400 with a reason ("chat not found", "message is too
+    # long") and this used to discard it — the turn recorded ok and the phone
+    # showed nothing. A refused send is a failed turn.
+    if r.status_code != 200:
+        raise RuntimeError(f"telegram sendMessage {r.status_code}: {r.text[:300]}")
 
 
 async def ack(channel_msg_id: str) -> None:

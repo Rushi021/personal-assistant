@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 from supabase import Client, create_client
 
-OPEN = ("todo", "doing")
+OPEN = ("todo", "in progress")
 
 _sb: Client | None = None
 
@@ -80,7 +80,7 @@ def week_minutes_used(user_id: str, week_start_on: date) -> int:
 
 
 def recent_messages(user_id: str, limit: int = 20) -> list[dict]:
-    rows = (sb().table("messages").select("role,content")
+    rows = (sb().table("messages").select("role,content,meta")
             .eq("user_id", user_id).order("created_at", desc=True)
             .limit(limit).execute().data)
     return list(reversed(rows))
@@ -99,6 +99,44 @@ def save_message(user_id: str, role: str, content: str,
         sb().table("messages").insert({
             "user_id": user_id, "role": role, "content": content,
             "channel_msg_id": channel_msg_id, "meta": meta or {},
+        }).execute()
+        return True
+    except Exception as e:
+        if "23505" in str(e) or "duplicate key" in str(e):
+            return False
+        raise
+
+
+def seen_message_ids(user_id: str, ids: list[str]) -> set[str]:
+    """Which of these Gmail ids have already been handled (Phase 1b).
+
+    One query for the whole window rather than one per message: the poll lists
+    two days of mail every hour and almost all of it is already done, so this
+    is what keeps the steady state at a handful of messages.get calls.
+    """
+    if not ids:
+        return set()
+    rows = (sb().table("email_events").select("gmail_message_id")
+            .eq("user_id", user_id).in_("gmail_message_id", ids).execute().data)
+    return {r["gmail_message_id"] for r in rows}
+
+
+def record_email_event(user_id: str, gmail_message_id: str, lane: str | None,
+                       outcome: str, sender: str, subject: str,
+                       detail: dict) -> bool:
+    """False means this message was already recorded — the same guarantee
+    save_message() gives, from the same kind of unique index
+    (email_events_dedupe_idx).
+
+    `detail` carries extracted scalars only. The body never comes near this
+    function; evaluation_plan.md §4 is a trust boundary, not a preference.
+    """
+    try:
+        sb().table("email_events").insert({
+            "user_id": user_id, "gmail_message_id": gmail_message_id,
+            "lane": lane, "outcome": outcome,
+            "sender": sender[:400], "subject": (subject or "")[:400],
+            "detail": detail,
         }).execute()
         return True
     except Exception as e:

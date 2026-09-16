@@ -13,9 +13,9 @@ model's judgement about "have I already nagged today" is not a guarantee:
 
 from datetime import date
 
-from anthropic import beta_tool
+from core.tool import tool as beta_tool
 
-from core import ctx, db
+from core import audit, ctx, db
 from core.channels.base import Button
 
 BULK_THRESHOLD = 8
@@ -104,7 +104,8 @@ def day_status() -> dict:
 
     # The nag guard. Flipping it here is what makes "five captures produce one
     # nudge" true regardless of what the model decides to say.
-    should_nudge = bool(stale) and user["last_nudge_on"] != today.isoformat()
+    nudged_on = user["last_nudge_on"]          # the value that decided it, pre-flip
+    should_nudge = bool(stale) and nudged_on != today.isoformat()
     if should_nudge:
         db.sb().table("users").update(
             {"last_nudge_on": today.isoformat()}).eq("id", user["id"]).execute()
@@ -113,7 +114,7 @@ def day_status() -> dict:
     used = db.week_minutes_used(user["id"], db.week_start(user))
 
     # A6: minutes decide when to speak. They are not part of the answer.
-    return {
+    out = {
         "today": today.isoformat(),
         "committed_today": [{"id": t["id"], "title": t["title"],
                              "priority_level": t["priority_level"]} for t in committed],
@@ -127,6 +128,15 @@ def day_status() -> dict:
         "week_is_full": used >= user["weekly_budget_min"],
         "unplanned_count": len(db.unplanned_tasks(user["id"])),
     }
+    # A6 hides the minutes from you, which also hides them from the debugger.
+    # When it says "that's a full week" and you disagree, this is the only
+    # record of whether the model misread the boolean or the boolean was wrong.
+    audit.step("decision", name="day_status", **{
+        "in": {"used_min": used, "budget_min": user["weekly_budget_min"],
+               "last_nudge_on": nudged_on, "slip_threshold": user["slip_threshold"],
+               "stale": len(stale)},
+        "out": out})
+    return out
 
 
 TOOLS = [day_status]
