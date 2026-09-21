@@ -13,28 +13,44 @@ core/registry.py            capability auto-discovery (D3)
 core/db.py                  supabase client, five reads, one definition of "today"
 core/ctx.py                 per-turn user + outbound card buffer
 core/stt.py                 Groq whisper, voice notes only (D1)
+core/audit.py               one audit_log row per turn — evaluation_plan.md
 core/channels/base.py       the Channel contract (D11)
 core/channels/telegram.py   the one implementation
 capabilities/tasks.py       six tools
 capabilities/planning.py    day_status() + the rules that live in the prompt
+capabilities/expenses.py    log/split/settle, analytics, the 21:00 digest
+capabilities/gmail.py       the hourly poll, three lanes' writes — PLAN-GMAIL.md
+capabilities/gmail_parse.py the email rules: router, payment, spend, application
 test_flow.py                the checks, written per-step
+test_gmail.py               the email rules, offline — no network, no DB
+test_phase1.py              recurrence, expenses, digest, and one end-to-end pass
+evaluation_plan.md          what is logged, why, and the failure -> fix loop
 ```
 
 ## 1. Database — your step
 
 Open the Supabase SQL editor and run [migrations/001_init.sql](migrations/001_init.sql)
-after editing the last statement:
+after editing the last statement, then [migrations/002_audit_log.sql](migrations/002_audit_log.sql)
+as-is:
 
 - `channel_user_id` — your Telegram chat id, from `@userinfobot`
 - `timezone` — **your real IANA zone**, e.g. `Asia/Kolkata`. Every notion of
   "today" comes from this column. Leaving it `UTC` silently breaks the rollover
   for a few hours each night and works fine the rest of the time.
 
+Then [003_expenses.sql](migrations/003_expenses.sql),
+[004_email.sql](migrations/004_email.sql) and
+[005_recurring.sql](migrations/005_recurring.sql) for expenses, the Gmail poll
+and recurring reminders. Edit `users.cards` afterwards so the match strings are
+what your banks actually write — that object is the only thing that maps a bank
+email to one of your cards ([PLAN-EXPENSES.md](PLAN-EXPENSES.md) E8). Gmail
+setup is in [PLAN-GMAIL.md](PLAN-GMAIL.md) §4.
+
 Then verify the index the morning query depends on:
 
 ```sql
 explain select * from tasks
- where user_id = '<your uuid>' and status in ('todo','doing')
+ where user_id = '<your uuid>' and status in ('todo','in progress')
    and planned_on <= current_date;
 -- wants: Index Scan using tasks_open_planned_idx   (not Seq Scan)
 ```
@@ -49,7 +65,7 @@ bypasses RLS by design (A5), so it never goes near a browser.
 
 ```bash
 fly secrets set TELEGRAM_BOT_TOKEN=... TELEGRAM_WEBHOOK_SECRET=... \
-  ANTHROPIC_API_KEY=... GROQ_API_KEY=... \
+  MISTRAL_API_KEY=... GROQ_API_KEY=... \
   SUPABASE_URL=... SUPABASE_SERVICE_KEY=... CRON_SECRET=...
 ```
 
@@ -97,16 +113,15 @@ The ones you should personally watch on day one, because each fails silently:
   Friday, `estimate_min` ≤ 10, `category` `money`, none of it named by you.
 - Tap **Done** → replies in under a second, and that turn's `messages.meta`
   contains no `model` key. Zero tokens is the point of the fast path.
-- Second turn onward → `meta.cache_read_input_tokens > 0`. Zero means something
-  volatile is sitting in the cached prefix (D7). Note the prefix must clear the
-  model's minimum — on Haiku that is 2048 tokens of tools plus system prompt.
-- A week of `meta.cost_usd` summed → compare against the $13/month estimate.
+- Second turn onward → tokens are being consumed correctly (Mistral does not
+  support prompt caching, so `cache_read_tokens` will always be 0).
+- A week of `meta.cost_usd` summed → compare against expected Mistral costs.
 
 ## Known ceilings
 
 - **Model routing is by path, not intent** (D7): the 11am check-in uses
-  `claude-opus-5`, every chat turn uses `claude-haiku-4-5`. If chat-side
-  judgement disappoints, promote `CHAT_MODEL` in `core/turn.py` — one line.
+  `mistral-small-latest`, every chat turn uses `mistral-small-latest`. If
+  chat-side judgement disappoints, promote `CHAT_MODEL` in `core/turn.py` — one line.
 - **Blocking calls run in a thread** (`asyncio.to_thread`). Correct and simple
   at one user; revisit if this ever serves many.
 - **The 5-minute question drop** (`meta.pending_question`) is specced in the

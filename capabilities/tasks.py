@@ -4,11 +4,13 @@ A capability is one file (D3): TOOLS is required, PROMPT is optional, and core
 never learns this module's name.
 """
 
-from datetime import date, datetime, timezone
+import calendar as _cal
+import re
+from datetime import date, datetime, timedelta, timezone
 
 from core.tool import tool as beta_tool
 
-from core import ctx, db
+from core import audit, ctx, db
 from core.channels.base import Button
 
 from . import calendar
@@ -30,7 +32,66 @@ TASKS
   exam, a flight) — not for self-imposed dates.
 - Never ask for a field you can reasonably infer. One short confirmation line.
 - Task ids are uuids: never invent one, only use ids a tool returned.
+
+RECURRING REMINDERS
+- recur makes a task come back after it is done: "daily", "weekly:mon",
+  "monthly:15", "monthly:last", "yearly:03-15". Set it whenever the user says
+  every / each / monthly / annually — "cancel the trial every month on the 3rd"
+  is recur="monthly:3", not three separate tasks.
+- Always set planned_on to the FIRST occurrence when you set recur. The task
+  moves itself forward from there; never add future copies by hand.
+- A recurring bill or subscription is category money and usually
+  deadline_hard — missing it costs real money.
 """
+
+# --- recurrence -------------------------------------------------------------
+#
+# A recurring task is ONE row that moves forward when it is finished, leaving a
+# dated copy behind as the record (migrations/005_recurring.sql). Nothing is
+# materialised in advance, so there is no cron job here that could run twice.
+
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_RECUR = re.compile(
+    r"^(daily|weekly:(?:mon|tue|wed|thu|fri|sat|sun)|"
+    r"monthly:(?:[1-9]|[12]\d|3[01]|last)|yearly:\d{2}-\d{2})$")
+
+
+def valid_recur(rule: str | None) -> bool:
+    return bool(rule) and bool(_RECUR.match(rule.strip().lower()))
+
+
+def _month_day(year: int, month: int, day: int | str) -> date:
+    """Clamp to the month's real length. 'monthly:31' in February is the 28th
+    (or 29th) — the alternative is skipping February entirely, which for a bill
+    reminder is the expensive kind of wrong."""
+    last = _cal.monthrange(year, month)[1]
+    return date(year, month, last if day == "last" else min(int(day), last))
+
+
+def next_occurrence(rule: str | None, after: date) -> date | None:
+    """The next date strictly after `after`, or None if the rule is unusable.
+
+    An unparseable rule is not an error: the task simply behaves as a one-off.
+    A reminder that throws on completion would be worse than one that stops
+    repeating, because you would find out by the task refusing to close.
+    """
+    if not valid_recur(rule):
+        return None
+    kind, _, arg = rule.strip().lower().partition(":")
+
+    if kind == "daily":
+        return after + timedelta(days=1)
+    if kind == "weekly":
+        ahead = (_WEEKDAYS.index(arg) - after.weekday()) % 7
+        return after + timedelta(days=ahead or 7)
+    if kind == "monthly":
+        year, month = (after.year + 1, 1) if after.month == 12 else (after.year, after.month + 1)
+        this = _month_day(after.year, after.month, arg)
+        # Set on the 25th but completed on the 3rd? The 25th is still ahead.
+        return this if this > after else _month_day(year, month, arg)
+    month, _, day = arg.partition("-")
+    this = _month_day(after.year, int(month), int(day))
+    return this if this > after else _month_day(after.year + 1, int(month), int(day))
 
 
 def render(task: dict) -> None:
@@ -50,7 +111,7 @@ def _slim(task: dict) -> dict:
 def add_task(title: str, planned_on: str | None = None, planned_at: str | None = None,
              due_on: str | None = None, deadline_hard: bool = False, estimate_min: int = 25,
              priority_level: str = "normal", category: str | None = None,
-             notes: str | None = None) -> dict:
+             notes: str | None = None, recur: str | None = None) -> dict:
     """Add a task. Capture is never blocked — call this first, discuss after.
 
     Args:
@@ -66,12 +127,21 @@ def add_task(title: str, planned_on: str | None = None, planned_at: str | None =
         priority_level: high | normal | low.
         category: money | admin | work | study | health | life.
         notes: Anything said that does not belong in the title.
+        recur: Makes it a repeating reminder: "daily", "weekly:mon",
+            "monthly:15", "monthly:last", or "yearly:03-15". Set planned_on to
+            the first occurrence as well. The task moves itself forward each
+            time it is completed — never add future copies by hand.
     """
+    if recur and not valid_recur(recur):
+        # Refusing is better than silently storing a rule that never fires: the
+        # user would believe the reminder exists and hear nothing again.
+        return {"error": "unusable recur rule", "recur": recur,
+                "allowed": "daily | weekly:mon | monthly:15 | monthly:last | yearly:03-15"}
     row = db.sb().table("tasks").insert({
         "user_id": ctx.user()["id"], "title": title,
         "planned_on": planned_on, "due_on": due_on, "deadline_hard": deadline_hard,
         "estimate_min": estimate_min, "priority_level": priority_level,
-        "category": category, "notes": notes,
+        "category": category, "notes": notes, "recur": recur,
         "source": ctx.source(),
         "meta": {"planned_at": planned_at} if planned_at else {},
     }).execute().data[0]
@@ -155,15 +225,78 @@ def update_task(task_id: str, title: str | None = None, planned_on: str | None =
     return _update(task_id, fields) if fields else {"error": "nothing to update"}
 
 
+def complete(task_id: str, user_id: str, tz: str) -> dict | None:
+    """Finish a task. The ONE place completion happens, because a recurring
+    task finishing is not an update — it is a write and a roll, and the Done
+    button (D4) must do exactly what the tool does.
+
+    A recurring task leaves a dated `done` copy behind and moves itself to its
+    next occurrence. Without the copy there would be no record you ever paid
+    August's bill; without the roll you would have to re-add the reminder every
+    month, which is the thing you asked not to do.
+
+    Returns the row as the user should hear about it, or None if nothing
+    matched — a second tap of Done, or someone else's task.
+    """
+    cur = (db.sb().table("tasks").select("*")
+           .eq("id", task_id).eq("user_id", user_id)
+           .in_("status", db.OPEN).execute().data)
+    if not cur:
+        return None
+    task = cur[0]
+    now = datetime.now(timezone.utc).isoformat()
+
+    nxt = next_occurrence(task.get("recur"),
+                          date.fromisoformat(task["planned_on"])
+                          if task["planned_on"] else db.local_today({"timezone": tz}))
+    if not nxt:
+        r = (db.sb().table("tasks")
+             .update({"status": "done", "completed_at": now})
+             .eq("id", task_id).eq("user_id", user_id)
+             .in_("status", db.OPEN).execute())
+        if not r.data:
+            return None
+        calendar.sync(r.data[0], tz)
+        return r.data[0]
+
+    # The record of this occurrence. recur is null on the copy so the history
+    # can never roll itself forward a second time.
+    db.sb().table("tasks").insert({
+        **{k: task[k] for k in ("user_id", "title", "notes", "planned_on",
+                                "due_on", "deadline_hard", "estimate_min",
+                                "priority_level", "category", "source")},
+        "status": "done", "completed_at": now, "recur": None,
+        "meta": {"recurred_from": task["id"]},
+    }).execute()
+
+    # The live row moves on. slip_count resets: a reminder that has come round
+    # again is not a task you have been avoiding, and leaving the count would
+    # make the assistant challenge you about a bill you pay every month.
+    r = (db.sb().table("tasks").update({
+        "planned_on": nxt.isoformat(), "slip_count": 0,
+        "meta": {k: v for k, v in (task["meta"] or {}).items()
+                 if k not in ("slipped_on", "challenged")},
+    }).eq("id", task_id).eq("user_id", user_id).execute())
+    audit.step("write", table="tasks", op="recur", row=task_id, next=nxt.isoformat())
+    calendar.sync(r.data[0], tz)
+    return {**r.data[0], "recurred_to": nxt.isoformat()}
+
+
 @beta_tool
 def complete_task(task_id: str) -> dict:
-    """Mark a task done.
+    """Mark a task done. A recurring reminder rolls to its next date instead of
+    closing, and says so.
 
     Args:
         task_id: The uuid of the task.
     """
-    return _update(task_id, {"status": "done",
-                             "completed_at": datetime.now(timezone.utc).isoformat()})
+    row = complete(task_id, ctx.user()["id"], ctx.user()["timezone"])
+    if not row:
+        return {"error": "no such open task for this user", "task_id": task_id}
+    out = _slim(row)
+    if row.get("recurred_to"):
+        out["recurred_to"] = row["recurred_to"]
+    return out
 
 
 @beta_tool

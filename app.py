@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from capabilities import gmail, tasks
+from capabilities import expenses, gmail, tasks
 from core import audit, ctx, db, models, stt
 from core.channels import telegram as channel
 from core.turn import PLANNING_MODEL, handle_turn
@@ -90,14 +90,19 @@ def _fast_path(user: dict, payload: str, channel_msg_id: str) -> list[tuple]:
             db.save_message(user["id"], "assistant", text, meta={"fast_path": True})
             return [(text, None)] + ctx.drain()
     elif kind == "d":
-        # in_(OPEN) is what makes a second tap a no-op. The dedupe above only
-        # catches Telegram redelivering ONE callback; a person tapping Done
-        # twice sends two different callback ids and sails straight past it.
-        row = db.sb().table("tasks").update(
-            {"status": "done", "completed_at": datetime.now(ZoneInfo("UTC")).isoformat()}
-        ).eq("id", task_id).eq("user_id", user["id"]).in_("status", db.OPEN).execute().data
+        # Routed through tasks.complete so the button and the tool cannot drift:
+        # a recurring reminder must roll forward whichever way it was finished.
+        # in_(OPEN) inside it is what makes a second tap a no-op — the dedupe
+        # above only catches Telegram redelivering ONE callback, and a person
+        # tapping Done twice sends two different callback ids.
+        row = tasks.complete(task_id, user["id"], user["timezone"])
         audit.step("write", table="tasks", op="done", row=task_id, matched=bool(row))
-        done = f"Done: {row[0]['title']}." if row else "Already handled."
+        if not row:
+            done = "Already handled."
+        elif row.get("recurred_to"):
+            done = f"Done: {row['title']}. Back on {row['recurred_to']}."
+        else:
+            done = f"Done: {row['title']}."
     elif kind == "t":
         row = tasks.roll_to(task_id, user["id"], today + timedelta(days=1))
         audit.step("write", table="tasks", op="roll", row=task_id, matched=bool(row))
@@ -232,6 +237,38 @@ async def tick(request: Request):
                 log.error("gmail poll failed for %s:\n%s",
                           user["id"], traceback.format_exc())
 
+    # The money message (E3, E4). Composed in code — no model call, so it is
+    # free, instant and cannot misquote an amount. Its own hour and its own
+    # guard: the check-in opens the day's work, this closes the day's spending.
+    digested = []
+    for user in users:
+        try:
+            today = db.local_today(user)
+            if datetime.now(ZoneInfo(user["timezone"])).hour != user.get("digest_hour", 21):
+                continue
+            if str(user.get("last_digest_on") or "") == today.isoformat():
+                continue          # hourly tick, one digest — same guard as the nag
+            # Opened BEFORE composing, so the digest's own decision step lands
+            # in the trace. A silent day still leaves a row: "why did I not get
+            # a digest" is only answerable if the quiet runs are recorded too.
+            audit.begin(user, "digest", "rules", "<system> expense digest")
+            text = await asyncio.to_thread(expenses.digest, user)
+            await asyncio.to_thread(db.mark_digest_sent, user, today)
+            if not text:
+                audit.finish("(nothing to report)")
+                continue          # nothing spent, nothing pending: say nothing
+            await _deliver(user["channel_user_id"], [(text, None)])
+            # Saved as a message so the model has it in context when the user
+            # replies "the amazon one was groceries" — without it that answer
+            # refers to something the assistant has no record of saying.
+            await asyncio.to_thread(db.save_message, user["id"], "assistant",
+                                    text, None, {"digest": True})
+            audit.finish(text)
+            digested.append(user["id"])
+        except Exception as e:
+            audit.finish(status="error", error=f"{type(e).__name__}: {e}")
+            log.error("digest failed for %s:\n%s", user["id"], traceback.format_exc())
+
     fired = []
     for user in users:
         try:
@@ -256,4 +293,4 @@ async def tick(request: Request):
     if datetime.now(ZoneInfo("UTC")).hour == 3:
         await asyncio.to_thread(audit.sweep)
 
-    return {"ok": True, "fired": fired}
+    return {"ok": True, "fired": fired, "digested": digested}

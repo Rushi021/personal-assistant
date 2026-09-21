@@ -139,7 +139,9 @@ def test_role_comes_from_for_not_from_at():
 
 def test_company_key_collapses_legal_suffixes():
     assert gp.company_key("Acme, Inc.") == gp.company_key("ACME Inc") == "acme"
-    assert gp.company_key("Acme  Labs") == "acme labs"   # not a legal suffix
+    # Spaces go too: an ATS slug and a human-written name must collapse.
+    assert gp.company_key("Acme  Labs") == "acmelabs"
+    assert gp.company_key("CVS Health") == gp.company_key("cvshealth")
 
 
 def test_split_sender():
@@ -237,6 +239,144 @@ def test_rejection_routes_even_from_a_human_sender():
     assert gp.route("Dana Reyes <dana@acme.com>", "Following up",
                     "We've decided to move forward with other candidates."
                     ) == "application"
+
+
+# --- real-mailbox regressions ------------------------------------------------
+#
+# Every case below is a sender/subject pair that actually arrived, found by
+# scanning two live mailboxes. They are here because the first implementation
+# got most of them wrong: "applying to AI Engineer III" filed under the job
+# title, "Talent Acquisition (Do Not Reply)" filed under "acquisition", and
+# an ATS address whose local part named the employer thrown away for the
+# vendor's domain.
+
+REAL_COMPANIES = [
+    # (sender, subject, expected company_key)
+    ("Amex Careers <careers@recruitment.americanexpress.com>",
+     "Thank you for applying to AI Engineer III - 26013067",
+     "americanexpress"),
+    ("CapitalOneHRWorkday <capitalone@myworkday.com>",
+     "Thank you for your interest", "capitalone"),
+    ("Colleague Zone <cvshealth@myworkday.com>",
+     "Thank you for your interest in CVS Health", "cvshealth"),
+    ("Guidehouse Workday Notification <guidehouse@myworkday.com>",
+     "Your Guidehouse Application for 42467 Data Scientist", "guidehouse"),
+    ('"Somatus, Inc. @ icims" <somatus+autoreply@talent.icims.com>',
+     "Thank You For Your Application", "somatus"),
+    ('"PlanSource @ icims" <plansource+autoreply@talent.icims.com>',
+     "Thank you for your application", "plansource"),
+    ("Do Not Reply <somatus+email+4yr2-c5eac0@talent.icims.com>",
+     "Somatus Application Update", "somatus"),
+    ("Mercor Hiring Team <no-reply@ashbyhq.com>",
+     "Thanks for applying to Mercor!", "mercor"),
+    ("Baseten Hiring Team <no-reply@ashbyhq.com>",
+     "Following up from Baseten", "baseten"),
+    ("Charta Health Hiring Team <no-reply@ashbyhq.com>",
+     "Charta Health Application Update", "chartahealth"),
+    ("Distyl Recruiting - No Reply <no-reply-ashby@distyl.ai>",
+     "Distyl: Update on Your Application", "distyl"),
+    ("systemmessage@paycomonline.com",
+     "Your Application With Sunlight Financial", "sunlightfinancial"),
+    ('"Harvest Group People & Culture" <recruiting@harvestgroup.com>',
+     "Harvest Group | Data Analyst, Amazon", "harvestgroup"),
+    ('"Talent Acquisition (Do Not Reply)" <careers@recruiting.uhg.com>',
+     "Associate AI/ML Engineer-2372389 Opening at UnitedHealth Group", "uhg"),
+    ("Cognizant Talent Acquisition Group <TalentAcquisitionGroup@cognizant.com>",
+     "We've received your application!", "cognizant"),
+    ("Oden Technologies Hiring Team <no-reply@ashbyhq.com>",
+     "Thank you for your Application to Oden Technologies", "odentechnologies"),
+]
+
+
+def test_real_sender_subject_pairs_resolve_to_the_employer():
+    bad = []
+    for sender, subject, expected in REAL_COMPANIES:
+        out = gp.parse_application(sender, subject, "Thanks for applying.")
+        got = out["company_key"] if out else None
+        if got != expected:
+            bad.append(f"{subject[:42]!r} -> {got!r}, wanted {expected!r}")
+    assert not bad, "company extraction regressed:\n  " + "\n  ".join(bad)
+
+
+def test_one_employer_reaching_us_two_ways_gets_one_key():
+    """The duplicate-row bug: an ATS slug and a human-written name are the
+    same employer and must produce the same key, or a rejection never finds
+    the receipt it is meant to close."""
+    from_ats = gp.parse_application("Colleague Zone <cvshealth@myworkday.com>",
+                                    "Application update", "we have decided to "
+                                    "proceed with other applicants.")
+    from_subject = gp.parse_application("no-reply@example.com",
+                                        "Thank you for applying to CVS Health",
+                                        "Thanks!")
+    assert from_ats["company_key"] == from_subject["company_key"] == "cvshealth"
+
+
+def test_a_job_title_is_never_taken_as_the_employer():
+    out = gp.parse_application(
+        "Amex Careers <careers@recruitment.americanexpress.com>",
+        "Thank you for applying to AI Engineer III - 26013067", "Thanks.")
+    assert "engineer" not in out["company_key"], out
+    assert not out["company_key"].isdigit()
+
+
+def test_marketing_thanks_for_your_interest_is_not_an_application():
+    """'Thanks for your interest in Apple.' is an ad. The phrase is genuine in
+    both contexts, so only the surrounding words separate them."""
+    assert gp.route("Apple <news@email.apple.com>",
+                    "Thanks for your interest in Apple.",
+                    "Discover the new iPhone lineup and Apple Watch. "
+                    "Shop now and save on your next purchase.") is None
+
+
+def test_the_same_phrase_with_application_context_still_counts():
+    out = gp.parse_application("Colleague Zone <cvshealth@myworkday.com>",
+                               "Thank you for your interest in CVS Health",
+                               "We received your application for the Data "
+                               "Analyst position and will review your resume.")
+    assert out and out["status"] == "applied", out
+
+
+REAL_IGNORED = [
+    # Bank and retail marketing that must never reach a money lane. All of
+    # these were sitting in the live mailboxes next to the real thing.
+    ("Chase <no-reply@mcmap.chase.com>",
+     "Rushi, Earn a $200 bonus plus unlimited 1.5% cash back"),
+    ("Chase <no-reply@mcmap.chase.com>",
+     "Rushi, earn $1000 Bonus Cash Back with Chase Ink Business Unlimited"),
+    ("Apple <no_reply@insideapple.apple.com>",
+     "Pay your Apple Card bill easily. And save on interest when you do."),
+    ("Kohl's <sale@s.kohls.com>",
+     "Labor Day Sale $5 Kohl's Cash for every $25 spent"),
+    ("Kohl's <sale@s.kohls.com>",
+     "$10 off your $25 purchase, $5 Kohl's Cash for every $25 spent"),
+    ("Hertz <marketing@emails.hertz.com>",
+     "Up to $750 off car purchases OR 20% off rentals"),
+    ("Glassdoor Jobs <noreply@glassdoor.com>",
+     "Senior Data Scientist at DOWC and 4 more jobs in New York"),
+    ("Jobright Job Alert <noreply@jobright.ai>",
+     "NVIDIA just posted a 77% match Research Scientist role"),
+    ("Walmart <noreply@walmart.com>",
+     "Reminder: Complete Your Application to Be Considered"),
+    ("UnitedHealth Group Careers <careers@uhgtalentcommunity.com>",
+     "Welcome to our Talent Community."),
+]
+
+
+def test_real_marketing_mail_stays_ignored():
+    """Precision, measured on the noise that actually shares the mailbox.
+    'Cash back', 'every $25 spent' and 'pay your bill' are the traps."""
+    wrong = [(s, subj, gp.route(s, subj, "Shop now. Terms apply. Offer ends soon."))
+             for s, subj in REAL_IGNORED
+             if gp.route(s, subj, "Shop now. Terms apply. Offer ends soon.")]
+    assert not wrong, f"false positives on marketing: {wrong}"
+
+
+def test_roles_do_not_swallow_the_employer():
+    out = gp.parse_application("Mercor Hiring Team <no-reply@ashbyhq.com>",
+                               "Thanks for applying to Mercor!",
+                               "We received your application for the Data "
+                               "Scientist role at Mercor.")
+    assert out["role"] == "data scientist", out
 
 
 # --- the write paths, against an in-memory stand-in --------------------------

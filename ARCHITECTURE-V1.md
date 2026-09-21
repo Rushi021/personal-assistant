@@ -150,7 +150,7 @@ This is the part you care most about, so it is deliberately small. **A capabilit
 ```python
 # capabilities/tasks.py
 
-from anthropic import beta_tool
+from core.tool import tool as beta_tool
 
 @beta_tool
 def add_task(title: str, planned_on: str | None = None, due_on: str | None = None,
@@ -257,7 +257,7 @@ erDiagram
         uuid user_id FK
         text title
         text notes
-        text status "todo|doing|done|dropped"
+        text status "todo|in progress|done|dropped"
         date planned_on "the day I intend to do it"
         date due_on "external deadline, if any"
         bool deadline_hard "real consequence if missed"
@@ -337,26 +337,25 @@ So the feature you wanted is not expressible on WhatsApp without degrading it. A
 
 ### D7 — Models and cost
 
-Python. Anthropic SDK. Two models, routed by *which path*, not by intent classification:
+Python. Mistral AI SDK. Two models, routed by *which path*, not by intent classification:
 
 | Route | Model | Why | Est. volume | Est. $/mo |
 |-------|-------|-----|-------------|-----------|
 | Fast path (button taps) | **none** | deterministic parse | ~40% of turns | $0.00 |
-| Conversational CRUD | `claude-haiku-4-5` | short, structured, high frequency | ~500 turns | ~$3 |
-| Daily rollover + prioritisation | `claude-opus-5` | real reasoning, judgement about your day | 1–2/day | ~$3 |
-| Gmail extraction (1b) | `claude-opus-5` | precision matters — a missed bill is the failure case | batched, 1/day | ~$2 |
+| Conversational CRUD | `mistral-small-latest` | short, structured, high frequency | ~500 turns | ~$0.30 |
+| Daily rollover + prioritisation | `mistral-small-latest` | planning briefing | 1–2/day | ~$0.01 |
 | Voice transcription | Groq `whisper-large-v3-turbo` | $0.04/hr, every note (D1 correction) | — | <$0.10 |
-| 11am check-in | `claude-opus-5` | one composed briefing a day | 30/mo | ~$1 |
+| 11am check-in | `mistral-small-latest` | one composed briefing a day | 30/mo | ~$0.05 |
 | Telegram | — | no per-message cost, unlike WhatsApp | — | $0.00 |
 | Hosting | Fly.io | always-on webhook | — | ~$5 |
 | Supabase | free tier | 500MB DB, plenty | — | $0 |
-| | | | **Total** | **≈$13/mo** |
+| | | | **Total** | **≈$5-6/mo** |
 
-**Prompt caching** on the system prompt + tool definitions is a further ~10x reduction on cached input and should be on from day one. Verify it works by checking `usage.cache_read_input_tokens` is non-zero — if it's zero, something volatile (a timestamp, an unsorted dict) is in the cached prefix.
+Mistral does not support prompt caching; `cache_read_tokens` will always be 0 in the audit log.
 
 Note on Supabase free tier: projects **pause after 7 days of inactivity**. Daily use makes this a non-issue; a daily cron makes it impossible.
 
-> The escape hatch if quality disappoints: promote the CRUD route from Haiku to Opus 5 at `effort: "low"`. That's a one-line change and still lands near $20.
+> The escape hatch if quality disappoints: promote the CRUD route from `mistral-small-latest` to `mistral-large-latest`. That's a one-line change in `core/turn.py`.
 
 ### D8 — Capture is never blocked. The gate moved.
 

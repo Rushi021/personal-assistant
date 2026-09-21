@@ -79,6 +79,71 @@ def week_minutes_used(user_id: str, week_start_on: date) -> int:
     return sum(r["estimate_min"] for r in rows)
 
 
+def expenses_between(user_id: str, start: date, end: date) -> list[dict]:
+    """Rows in [start, end). The digest, the breakdown and every total read
+    through here — one index scan on expenses_month_idx.
+
+    Deleted rows are excluded; cc_payment and transfer rows are NOT. They are
+    real rows the digest lists, and it is the `kind` filter at the point of
+    summing that keeps them out of spending totals (E7)."""
+    return (sb().table("expenses").select("*")
+            .eq("user_id", user_id).neq("status", "deleted")
+            .gte("spent_at", start.isoformat())
+            .lt("spent_at", end.isoformat())
+            .order("spent_at").execute().data)
+
+
+def outstanding_owed(user_id: str) -> float:
+    rows = (sb().table("expenses").select("owed_amount")
+            .eq("user_id", user_id).neq("status", "deleted")
+            .gt("owed_amount", 0).execute().data)
+    return round(sum(float(r["owed_amount"]) for r in rows), 2)
+
+
+def pending_expenses(user_id: str) -> list[dict]:
+    """Email-extracted rows whose amount counts but whose meaning you have not
+    supplied yet (E2). The digest asks about these."""
+    return (sb().table("expenses").select("*")
+            .eq("user_id", user_id).eq("status", "pending")
+            .order("spent_at").execute().data)
+
+
+def recent_chat_expense(user_id: str, amount: str, within_min: int = 60) -> dict | None:
+    """E2, email direction: did you already tell it about this spend?
+
+    An email whose amount matches a chat row from the last hour adds nothing —
+    you said it first. 60 minutes is the one place a time window is the right
+    tool: a bank alert lands within about an hour of the swipe.
+    """
+    since = datetime.now(ZoneInfo("UTC")) - timedelta(minutes=within_min)
+    rows = (sb().table("expenses").select("*")
+            .eq("user_id", user_id).eq("source", "chat").eq("amount", amount)
+            .neq("status", "deleted")
+            .gte("created_at", since.isoformat()).execute().data)
+    return rows[0] if rows else None
+
+
+def pending_match(user_id: str, amount: str, on: date) -> list[dict]:
+    """E2, chat direction: is this spend already sitting here as a pending row?
+
+    Returns every match, because the count decides the behaviour — one attaches,
+    two means the digest asks rather than guessing between two real charges.
+    """
+    return (sb().table("expenses").select("*")
+            .eq("user_id", user_id).eq("status", "pending").eq("amount", amount)
+            .gte("spent_at", on.isoformat())
+            .lt("spent_at", (on + timedelta(days=1)).isoformat())
+            .execute().data)
+
+
+def applications(user_id: str, status: str | None = None) -> list[dict]:
+    q = (sb().table("applications").select("*")
+         .eq("user_id", user_id).order("last_email_at", desc=True))
+    if status:
+        q = q.eq("status", status)
+    return q.execute().data
+
+
 def recent_messages(user_id: str, limit: int = 20) -> list[dict]:
     rows = (sb().table("messages").select("role,content,meta")
             .eq("user_id", user_id).order("created_at", desc=True)
@@ -154,6 +219,15 @@ def has_activity_today(user: dict) -> bool:
          .eq("user_id", user["id"]).in_("role", ["user", "system"])
          .gte("created_at", start.isoformat()).limit(1).execute())
     return bool(r.data)
+
+
+def mark_digest_sent(user: dict, on: date) -> None:
+    """The once-a-day guard for the expense digest, flipped whether or not
+    there was anything to say — a quiet day must not leave the door open for
+    the next hour's tick to try again."""
+    sb().table("users").update({"last_digest_on": on.isoformat()}).eq(
+        "id", user["id"]).execute()
+    user["last_digest_on"] = on.isoformat()
 
 
 def all_users() -> list[dict]:

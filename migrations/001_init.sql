@@ -1,4 +1,4 @@
--- ============================================================================
+ -- ============================================================================
 -- 001_init.sql  ·  Personal Assistant V1
 --
 -- DRAFT. Expect to rename columns and add more in week one — that is the plan,
@@ -66,7 +66,7 @@ create table if not exists tasks (
   notes          text,
 
   status         text not null default 'todo'
-                   check (status in ('todo','doing','done','dropped')),
+                   check (status in ('todo','in progress','done','dropped')),
 
   planned_on     date,                                   -- null = captured, not scheduled
   due_on         date,                                   -- null = no external deadline
@@ -96,12 +96,12 @@ create table if not exists tasks (
 -- "everything still open that was planned on or before <date>".
 create index if not exists tasks_open_planned_idx
   on tasks (user_id, planned_on)
-  where status in ('todo','doing');
+  where status in ('todo','in progress');
 
 -- Deadline sweep: what's coming due, scheduled or not.
 create index if not exists tasks_open_due_idx
   on tasks (user_id, due_on)
-  where status in ('todo','doing') and due_on is not null;
+  where status in ('todo','in progress') and due_on is not null;
 
 -- The inbox: captured and never given a day. This is the pile that rots.
 create index if not exists tasks_unplanned_idx

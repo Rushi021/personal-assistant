@@ -29,9 +29,13 @@ import base64
 import logging
 import os
 import re
+import sys
+import time
 import urllib.parse
+import webbrowser
 from datetime import datetime, timezone
 from html import unescape
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import httpx
 
@@ -41,9 +45,20 @@ from . import gmail_parse
 
 log = logging.getLogger("assistant.gmail")
 
-CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+CLIENT_ID = os.environ.get("GMAIL_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("GMAIL_CLIENT_SECRET", "")
+
+# One OAuth client, several mailboxes. Each account is its own env var:
+#
+#     GMAIL_TOKEN_PERSONAL=1//0g...
+#     GMAIL_TOKEN_WORK=1//0g...
+#
+# Discovered by prefix rather than listed anywhere, so adding a third mailbox
+# is one line in .env (or one `fly secrets set`) and no code change. The label
+# after the prefix is not decoration: it prefixes every stored message id,
+# because a Gmail id is unique WITHIN a mailbox and nothing guarantees two
+# accounts never mint the same one.
+TOKEN_PREFIX = "GMAIL_TOKEN_"
 
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -65,40 +80,77 @@ MAX_RESULTS = 100
 TOOLS: list = []   # nothing for the model to call — this capability polls
 
 
+def accounts() -> dict[str, str]:
+    """label -> refresh token, read fresh from the environment each call so a
+    mailbox added to .env needs no more than a restart."""
+    return {k[len(TOKEN_PREFIX):].lower(): v for k, v in os.environ.items()
+            if k.startswith(TOKEN_PREFIX) and v}
+
+
 def configured() -> bool:
-    return bool(CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN)
+    return bool(CLIENT_ID and CLIENT_SECRET and accounts())
 
 
 # --- the client -------------------------------------------------------------
 
-_token: tuple[str, float] | None = None   # (access_token, expires_at_epoch)
+_tokens: dict[str, tuple[str, float]] = {}   # label -> (access_token, expires_at)
 
 
-def _access_token() -> str:
-    """Refresh-token grant, cached until a minute before it expires. One
-    refresh an hour, which is what the tick needs and nothing more."""
-    global _token
+def _access_token(label: str) -> str:
+    """Refresh-token grant, cached per account until a minute before it
+    expires. One refresh per mailbox per hour, which is what the tick needs."""
     now = datetime.now(timezone.utc).timestamp()
-    if _token and _token[1] > now:
-        return _token[0]
+    cached = _tokens.get(label)
+    if cached and cached[1] > now:
+        return cached[0]
+    token = accounts().get(label)
+    if not token:
+        raise RuntimeError(f"no refresh token for gmail account {label!r}")
     r = httpx.post(TOKEN_URL, timeout=30, data={
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
-        "refresh_token": REFRESH_TOKEN, "grant_type": "refresh_token"})
+        "refresh_token": token, "grant_type": "refresh_token"})
+    if r.status_code >= 400 and "invalid_grant" in r.text:
+        # Almost always one of three things, and the raw error says none of
+        # them. Worth spelling out: this fires weeks after the setup that
+        # caused it, by which time the cause is not remotely obvious.
+        raise RuntimeError(
+            f"gmail account {label!r}: refresh token rejected (invalid_grant). "
+            "Either the OAuth consent screen is still in Testing — which "
+            "expires refresh tokens after 7 days, so publish it to production "
+            "— or access was revoked, or the token is for a different client. "
+            f"Reconnect with: python -m capabilities.gmail {label}")
     r.raise_for_status()
     body = r.json()
-    _token = (body["access_token"], now + body.get("expires_in", 3600) - 60)
-    return _token[0]
+    _tokens[label] = (body["access_token"], now + body.get("expires_in", 3600) - 60)
+    return _tokens[label][0]
 
 
-def _api(path: str, **params) -> dict:
+# Gmail answers a rate limit with 403, not 429, and the reason is buried in the
+# body — so a burst looks exactly like a permissions failure. The first poll of
+# a mailbox fetches up to MAX_RESULTS messages back to back, which is precisely
+# the shape that trips it.
+_RETRYABLE = ("rateLimitExceeded", "userRateLimitExceeded", "backendError")
+
+
+def _api(label: str, path: str, _attempt: int = 0, **params) -> dict:
     r = httpx.get(f"{API}{path}", timeout=30, params=params,
-                  headers={"Authorization": f"Bearer {_access_token()}"})
+                  headers={"Authorization": f"Bearer {_access_token(label)}"})
+    if r.status_code >= 400 and _attempt < 4:
+        body = r.text
+        if r.status_code in (429, 500, 503) or (
+                r.status_code == 403 and any(x in body for x in _RETRYABLE)):
+            # 1s, 2s, 4s, 8s. Plain exponential: one process, one mailbox at a
+            # time, so there is no thundering herd for jitter to break up.
+            delay = 2 ** _attempt
+            log.warning("gmail %s: %s, retrying in %ss", label, r.status_code, delay)
+            time.sleep(delay)
+            return _api(label, path, _attempt + 1, **params)
     r.raise_for_status()
     return r.json()
 
 
-def _list_ids() -> list[str]:
-    page = _api("/messages", q=QUERY, maxResults=MAX_RESULTS)
+def _list_ids(label: str) -> list[str]:
+    page = _api(label, "/messages", q=QUERY, maxResults=MAX_RESULTS)
     return [m["id"] for m in page.get("messages", [])]
 
 
@@ -140,13 +192,17 @@ def _text(payload: dict) -> str:
     return ""
 
 
-def _message(mid: str) -> dict:
-    msg = _api(f"/messages/{mid}", format="full")
+def _message(label: str, mid: str) -> dict:
+    msg = _api(label, f"/messages/{mid}", format="full")
     payload = msg.get("payload") or {}
     headers = {h["name"].lower(): h["value"]
                for h in payload.get("headers") or []}
     return {
-        "id": mid,
+        # Qualified with the mailbox it came from. This is what is stored as
+        # source_ref and as email_events.gmail_message_id, so the uniqueness
+        # those indexes promise holds across accounts and not just within one.
+        "id": f"{label}:{mid}",
+        "account": label,
         "sender": headers.get("from", ""),
         "subject": headers.get("subject", ""),
         "body": _text(payload),
@@ -199,7 +255,67 @@ def _write_payment(user: dict, msg: dict) -> tuple[str, dict]:
         # expenses_dedupe_idx did its job. Not an error: the row exists, which
         # is the outcome we wanted.
         detail["duplicate"] = True
+    # evaluation_plan.md §10.4 — log kind and card on EVERY extraction, right
+    # or wrong. This is the single largest possible error in the system, and a
+    # labelled set of these steps is the only way to measure it (E7).
+    audit.step("classify", kind="cc_payment", card=parsed["card"],
+               bank_label=parsed["bank_label"])
     return "payment", detail
+
+
+# --- Lane C · card spend alerts ---------------------------------------------
+
+def _write_spend(user: dict, msg: dict) -> tuple[str, dict]:
+    """A swipe. The amount, card and date count immediately; the meaning is
+    blank until the user answers the digest (E2, E6).
+
+    The row lands as `status='pending'` — that is not a half-written row, it is
+    a complete fact about money with a question attached.
+    """
+    parsed = gmail_parse.parse_spend(
+        msg["sender"], msg["subject"], msg["body"], user.get("cards") or {})
+    if not parsed:
+        return "unparsed_spend", {}
+
+    spent_on = parsed["spent_on"]
+    spent_at = (datetime(spent_on.year, spent_on.month, spent_on.day,
+                         tzinfo=timezone.utc) if spent_on else msg["at"])
+    amount = str(parsed["amount"])
+    detail = {"amount": amount, "spent_at": spent_at.isoformat(),
+              "card": parsed["card"], "merchant": parsed["merchant"]}
+
+    # E2, email direction: you already told it about this spend within the hour,
+    # so the email adds nothing. The DISCARD is logged — an email that vanishes
+    # without a record is indistinguishable from one that never arrived.
+    already = db.recent_chat_expense(user["id"], amount)
+    if already:
+        detail["discarded_against"] = already["id"]
+        audit.step("dedupe", decision="discarded", against=already["id"],
+                   amount=amount)
+        return "spend_discarded", detail
+
+    if not parsed["card"]:
+        log.info("spend with no card match: label=%r subject=%r",
+                 parsed["bank_label"], msg["subject"][:80])
+
+    try:
+        db.sb().table("expenses").insert({
+            "user_id": user["id"], "spent_at": spent_at.isoformat(),
+            "amount": amount, "share_amount": amount, "owed_amount": 0,
+            "headcount": 1, "kind": "spend",
+            # No category on purpose (E6). A guess here would read as an answer
+            # and the digest would never ask.
+            "category": None, "merchant": parsed["merchant"],
+            "card": parsed["card"], "source": "email", "source_ref": msg["id"],
+            "status": "pending",
+        }).execute()
+    except Exception as e:
+        if not _is_duplicate(e):
+            raise
+        detail["duplicate"] = True
+    audit.step("classify", kind="spend", card=parsed["card"],
+               merchant_raw=parsed["merchant"])
+    return "spend", detail
 
 
 # --- Lane B · applications --------------------------------------------------
@@ -267,27 +383,45 @@ def _is_duplicate(e: Exception) -> bool:
 # --- the poll ---------------------------------------------------------------
 
 def poll(user: dict) -> int:
-    """One pass over the window. Returns how many messages were processed.
+    """One pass over the window, across every configured mailbox. Returns how
+    many messages were processed.
 
     Runs from /cron/tick for every user with Gmail configured, independently of
-    the 11am check-in.
+    the 11am check-in. One mailbox failing — a revoked token, a rate limit —
+    must not cost you the others, so each is caught separately.
     """
-    ids = _list_ids()
-    seen = db.seen_message_ids(user["id"], ids)
-    fresh = [mid for mid in ids if mid not in seen]
-    audit.step("poll", listed=len(ids), seen=len(seen), fresh=len(fresh))
+    processed = 0
+    for label in sorted(accounts()):
+        try:
+            processed += _poll_account(user, label)
+        except Exception as e:
+            audit.step("poll", account=label, ok=False,
+                       error=f"{type(e).__name__}: {e}")
+            log.error("gmail account %s failed: %s", label, e)
+    return processed
+
+
+def _poll_account(user: dict, label: str) -> int:
+    ids = _list_ids(label)
+    refs = [f"{label}:{mid}" for mid in ids]
+    seen = db.seen_message_ids(user["id"], refs)
+    fresh = [mid for mid, ref in zip(ids, refs) if ref not in seen]
+    audit.step("poll", account=label, listed=len(ids), seen=len(seen),
+               fresh=len(fresh))
 
     processed = 0
     for mid in fresh:
         lane = outcome = None
         detail: dict = {}
-        msg = {"id": mid, "sender": "", "subject": "", "body": "",
-               "at": datetime.now(timezone.utc)}
+        msg = {"id": f"{label}:{mid}", "account": label, "sender": "",
+               "subject": "", "body": "", "at": datetime.now(timezone.utc)}
         try:
-            msg = _message(mid)
+            msg = _message(label, mid)
             lane = gmail_parse.route(msg["sender"], msg["subject"], msg["body"])
             if lane == "payment":
                 outcome, detail = _write_payment(user, msg)
+            elif lane == "spend":
+                outcome, detail = _write_spend(user, msg)
             elif lane == "application":
                 outcome, detail = _upsert_application(user, msg)
             else:
@@ -301,39 +435,105 @@ def poll(user: dict) -> int:
             outcome, detail = "error", {"error": f"{type(e).__name__}: {e}"}
             log.error("gmail message %s failed: %s", mid, e)
 
-        db.record_email_event(user["id"], mid, lane, outcome,
+        db.record_email_event(user["id"], msg["id"], lane, outcome,
                               msg["sender"], msg["subject"], detail)
-        audit.step("email", id=mid, lane=lane, outcome=outcome, **detail)
+        audit.step("email", id=msg["id"], lane=lane, outcome=outcome, **detail)
         processed += 1
     return processed
 
 
 # --- one-time setup ---------------------------------------------------------
 
-def setup() -> None:
-    """Get a refresh token. Run once, by hand: python -m capabilities.gmail
+def _consent(slug: str) -> tuple[str, str] | None:
+    """Run the loopback consent flow. Returns (code, redirect_uri).
 
-    Needs a GCP project with the Gmail API enabled and an OAuth client of type
-    "Desktop app" — its id and secret go in .env first.
+    Binds port 0 so the OS picks a free one, prints the URL, then serves
+    exactly one request — Google's redirect back with ?code=... in the query.
     """
-    if not (CLIENT_ID and CLIENT_SECRET):
-        print("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env first.")
-        print("console.cloud.google.com -> APIs & Services -> Credentials")
-        print("  -> Create credentials -> OAuth client ID -> Desktop app")
-        print("Enable the Gmail API for the project, and add yourself as a")
-        print("test user on the OAuth consent screen.")
-        return
-
-    redirect = "urn:ietf:wg:oauth:2.0:oob"
+    server = HTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+    redirect = f"http://127.0.0.1:{server.server_port}"
     params = urllib.parse.urlencode({
         "client_id": CLIENT_ID, "redirect_uri": redirect, "scope": SCOPE,
         "response_type": "code", "access_type": "offline", "prompt": "consent"})
-    print(f"\n1. Open this and approve read-only Gmail access:\n\n{AUTH_URL}?{params}\n")
-    code = input("2. Paste the code Google gives you: ").strip()
+    url = f"{AUTH_URL}?{params}"
+
+    print(f"\nConnecting the '{slug}' mailbox.")
+    print("\nSign your browser in to THAT account first — the consent screen "
+          "uses\nwhichever Google account the browser already has.\n")
+    print(f"Opening:\n{url}\n")
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass                      # headless box: the printed URL is the fallback
+    print("Waiting for the redirect… (Ctrl-C to give up)")
+
+    try:
+        handler = server.get_request()
+        # BaseHTTPRequestHandler parses the request line on construction, so
+        # this both reads the request and answers it.
+        conn, addr = handler
+        request = conn.recv(8192).decode("utf-8", "replace")
+    except KeyboardInterrupt:
+        return None
+    finally:
+        server.server_close()
+
+    path = request.split(" ", 2)[1] if " " in request else ""
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(path).query)
+    body = ("Connected. You can close this tab." if query.get("code")
+            else f"Something went wrong: {query.get('error', ['no code'])[0]}")
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                 b"Connection: close\r\n\r\n" + body.encode())
+    conn.close()
+
+    if not query.get("code"):
+        print(f"\n{body}")
+        return None
+    return query["code"][0], redirect
+
+
+def setup(label: str = "personal") -> None:
+    """Get a refresh token for one mailbox. Run once per account, by hand:
+
+        python -m capabilities.gmail personal
+        python -m capabilities.gmail work
+
+    Sign in as THAT account in the browser each time — the consent screen uses
+    whichever Google account the browser is already signed into, which is the
+    one way to end up with two env vars holding the same mailbox.
+
+    Needs a GCP project with the Gmail API enabled and an OAuth client of type
+    "Desktop app" — its id and secret go in .env first. One client covers every
+    account; only the token differs.
+    """
+    if not (CLIENT_ID and CLIENT_SECRET):
+        print("Set GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET in .env first.")
+        print("console.cloud.google.com -> APIs & Services -> Credentials")
+        print("  -> Create credentials -> OAuth client ID -> Desktop app")
+        print("Enable the Gmail API for the project, and add every address you")
+        print("plan to connect as a test user on the OAuth consent screen.")
+        return
+
+    slug = re.sub(r"[^a-z0-9]+", "_", label.strip().lower()).strip("_")
+    if not slug:
+        print("Give the account a one-word label: python -m capabilities.gmail work")
+        return
+    if slug in accounts():
+        print(f"GMAIL_TOKEN_{slug.upper()} is already set. Remove it from .env "
+              f"first if you want to reconnect this mailbox.")
+        return
+
+    # Loopback, not urn:ietf:wg:oauth:2.0:oob — Google blocked the
+    # copy-paste-the-code flow in 2022 and it now fails at the consent screen.
+    # A Desktop-app client accepts any http://127.0.0.1 port without it being
+    # registered, so this needs no extra setup in the console.
+    code = _consent(slug)
+    if not code:
+        return
 
     r = httpx.post(TOKEN_URL, timeout=30, data={
         "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
-        "code": code, "redirect_uri": redirect,
+        "code": code[0], "redirect_uri": code[1],
         "grant_type": "authorization_code"})
     if r.status_code >= 400:
         print(f"\nGoogle refused it: {r.status_code} {r.text[:300]}")
@@ -343,8 +543,9 @@ def setup() -> None:
         print("\nNo refresh token came back — revoke the app's access at "
               "myaccount.google.com/permissions and run this again.")
         return
-    print(f"\n3. Put this in .env:\n\nGOOGLE_REFRESH_TOKEN={token}\n")
+    print(f"\n3. Put this in .env:\n\nGMAIL_TOKEN_{slug.upper()}={token}\n")
+    print("Run this again with a different label to add another mailbox.")
 
 
 if __name__ == "__main__":
-    setup()
+    setup(sys.argv[1] if len(sys.argv) > 1 else "personal")
